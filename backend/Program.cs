@@ -4,25 +4,102 @@ using Microsoft.IdentityModel.Tokens;
 using System.Text;
 using CrypterLicense.Data;
 using CrypterLicense.Services;
-using CrypterLicense.Models;
 using Microsoft.OpenApi.Models;
 
 var builder = WebApplication.CreateBuilder(args);
 
-// Add services to the container
+// Add services to the container.
 builder.Services.AddControllers();
+
+// Configure Entity Framework
+var connectionString = builder.Configuration.GetConnectionString("DefaultConnection") 
+    ?? Environment.GetEnvironmentVariable("DATABASE_URL")
+    ?? "Host=localhost;Database=crypterlicense;Username=postgres;Password=password";
+
+// Convert Railway PostgreSQL URL format if needed
+if (connectionString.StartsWith("postgresql://"))
+{
+    var uri = new Uri(connectionString);
+    connectionString = $"Host={uri.Host};Port={uri.Port};Database={uri.AbsolutePath.Trim('/')};Username={uri.UserInfo.Split(':')[0]};Password={uri.UserInfo.Split(':')[1]};SSL Mode=Require;Trust Server Certificate=true";
+}
+
+builder.Services.AddDbContext<LicenseDbContext>(options =>
+    options.UseNpgsql(connectionString));
+
+// Configure JWT Authentication
+var jwtSettings = builder.Configuration.GetSection("JwtSettings");
+var secretKey = jwtSettings["SecretKey"] ?? Environment.GetEnvironmentVariable("JWT_SECRET_KEY") ?? "your-super-secret-jwt-key-that-should-be-at-least-32-characters-long";
+var key = Encoding.ASCII.GetBytes(secretKey);
+
+builder.Services.AddAuthentication(options =>
+{
+    options.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
+    options.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
+})
+.AddJwtBearer(options =>
+{
+    options.RequireHttpsMetadata = false; // Set to true in production
+    options.SaveToken = true;
+    options.TokenValidationParameters = new TokenValidationParameters
+    {
+        ValidateIssuerSigningKey = true,
+        IssuerSigningKey = new SymmetricSecurityKey(key),
+        ValidateIssuer = true,
+        ValidIssuer = jwtSettings["Issuer"] ?? "CrypterLicense",
+        ValidateAudience = true,
+        ValidAudience = jwtSettings["Audience"] ?? "CrypterLicense",
+        ValidateLifetime = true,
+        ClockSkew = TimeSpan.Zero
+    };
+});
+
+// Add Authorization
+builder.Services.AddAuthorization(options =>
+{
+    options.AddPolicy("AdminOnly", policy => policy.RequireRole("Admin"));
+    options.AddPolicy("UserOrAdmin", policy => policy.RequireRole("User", "Admin"));
+});
+
+// Configure CORS
+var corsOrigins = Environment.GetEnvironmentVariable("CORS_ALLOWED_ORIGINS")?.Split(',') 
+    ?? new[] { "http://localhost:3000", "https://localhost:3000" };
+
+builder.Services.AddCors(options =>
+{
+    options.AddPolicy("AllowSpecificOrigins", policy =>
+    {
+        policy.WithOrigins(corsOrigins)
+              .AllowAnyMethod()
+              .AllowAnyHeader()
+              .AllowCredentials();
+    });
+});
+
+// Register application services
+builder.Services.AddScoped<IAuthService, AuthService>();
+builder.Services.AddScoped<ILicenseService, LicenseService>();
+
+// Add Swagger/OpenAPI
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen(c =>
 {
-    c.SwaggerDoc("v1", new OpenApiInfo { Title = "Crypter License API", Version = "v1" });
+    c.SwaggerDoc("v1", new OpenApiInfo 
+    { 
+        Title = "CrypterLicense API", 
+        Version = "v1",
+        Description = "API for Crypter License Management System"
+    });
+    
+    // Add JWT authentication to Swagger
     c.AddSecurityDefinition("Bearer", new OpenApiSecurityScheme
     {
-        Description = "JWT Authorization header using the Bearer scheme",
+        Description = "JWT Authorization header using the Bearer scheme. Example: \"Authorization: Bearer {token}\"",
         Name = "Authorization",
         In = ParameterLocation.Header,
         Type = SecuritySchemeType.ApiKey,
         Scheme = "Bearer"
     });
+    
     c.AddSecurityRequirement(new OpenApiSecurityRequirement
     {
         {
@@ -39,94 +116,65 @@ builder.Services.AddSwaggerGen(c =>
     });
 });
 
-// Database configuration
-var connectionString = Environment.GetEnvironmentVariable("DATABASE_URL") 
-    ?? builder.Configuration.GetConnectionString("DefaultConnection");
+// Add Health Checks
+builder.Services.AddHealthChecks()
+    .AddDbContextCheck<LicenseDbContext>();
 
-if (!string.IsNullOrEmpty(connectionString) && connectionString.StartsWith("postgres://"))
-{
-    // Convert Railway PostgreSQL URL to Entity Framework format
-    var uri = new Uri(connectionString);
-    connectionString = $"Host={uri.Host};Port={uri.Port};Database={uri.AbsolutePath.Trim('/')};Username={uri.UserInfo.Split(':')[0]};Password={uri.UserInfo.Split(':')[1]};SSL Mode=Require;Trust Server Certificate=true";
-}
-else if (string.IsNullOrEmpty(connectionString))
-{
-    // Build connection string from individual environment variables
-    var host = Environment.GetEnvironmentVariable("DB_HOST") ?? "localhost";
-    var port = Environment.GetEnvironmentVariable("DB_PORT") ?? "5432";
-    var database = Environment.GetEnvironmentVariable("DB_NAME") ?? "crypter_license";
-    var username = Environment.GetEnvironmentVariable("DB_USER") ?? "postgres";
-    var password = Environment.GetEnvironmentVariable("DB_PASSWORD") ?? "password";
-    var sslMode = Environment.GetEnvironmentVariable("DB_SSL_MODE") ?? "Prefer";
-    
-    connectionString = $"Host={host};Port={port};Database={database};Username={username};Password={password};SSL Mode={sslMode};Trust Server Certificate=true";
-}
-
-builder.Services.AddDbContext<LicenseDbContext>(options =>
-    options.UseNpgsql(connectionString));
-
-// JWT Configuration
-var jwtKey = builder.Configuration["Jwt:Key"] ?? Environment.GetEnvironmentVariable("JWT_SECRET") ?? "CrypterLicense2024SecretKey123456789";
-var key = Encoding.ASCII.GetBytes(jwtKey);
-
-builder.Services.AddAuthentication(x =>
-{
-    x.DefaultAuthenticateScheme = JwtBearerDefaults.AuthenticationScheme;
-    x.DefaultChallengeScheme = JwtBearerDefaults.AuthenticationScheme;
-})
-.AddJwtBearer(x =>
-{
-    x.RequireHttpsMetadata = false;
-    x.SaveToken = true;
-    x.TokenValidationParameters = new TokenValidationParameters
-    {
-        ValidateIssuerSigningKey = true,
-        IssuerSigningKey = new SymmetricSecurityKey(key),
-        ValidateIssuer = false,
-        ValidateAudience = false,
-        ClockSkew = TimeSpan.Zero
-    };
-});
-
-// Register services
-builder.Services.AddScoped<ILicenseService, LicenseService>();
-builder.Services.AddScoped<IAuthService, AuthService>();
-builder.Services.AddScoped<IStubCleaningService, StubCleaningService>();
-builder.Services.AddHostedService<StubCleaningBackgroundService>();
-
-// CORS configuration
-builder.Services.AddCors(options =>
-{
-    options.AddPolicy("AllowAll", policy =>
-    {
-        policy.AllowAnyOrigin()
-              .AllowAnyMethod()
-              .AllowAnyHeader();
-    });
-});
+// Configure logging
+builder.Logging.ClearProviders();
+builder.Logging.AddConsole();
+builder.Logging.AddDebug();
 
 var app = builder.Build();
 
-// Configure the HTTP request pipeline
-if (app.Environment.IsDevelopment() || app.Environment.IsProduction())
+// Configure the HTTP request pipeline.
+if (app.Environment.IsDevelopment())
 {
     app.UseSwagger();
-    app.UseSwaggerUI();
+    app.UseSwaggerUI(c =>
+    {
+        c.SwaggerEndpoint("/swagger/v1/swagger.json", "CrypterLicense API V1");
+        c.RoutePrefix = string.Empty; // Serve Swagger UI at root
+    });
 }
 
+// Security headers
+app.Use(async (context, next) =>
+{
+    context.Response.Headers.Add("X-Content-Type-Options", "nosniff");
+    context.Response.Headers.Add("X-Frame-Options", "DENY");
+    context.Response.Headers.Add("X-XSS-Protection", "1; mode=block");
+    await next();
+});
+
 app.UseHttpsRedirection();
-app.UseCors("AllowAll");
+app.UseCors("AllowSpecificOrigins");
 app.UseAuthentication();
 app.UseAuthorization();
-app.MapControllers();
 
-// Ensure database is created
+app.MapControllers();
+app.MapHealthChecks("/health");
+
+// Ensure database is created and seeded
 using (var scope = app.Services.CreateScope())
 {
     var context = scope.ServiceProvider.GetRequiredService<LicenseDbContext>();
-    context.Database.EnsureCreated();
-    
-    // TODO: Add seed data initialization if needed
+    try
+    {
+        await context.Database.MigrateAsync();
+        app.Logger.LogInformation("Database migration completed successfully");
+    }
+    catch (Exception ex)
+    {
+        app.Logger.LogError(ex, "An error occurred while migrating the database");
+        throw;
+    }
 }
+
+// Configure port
+var port = Environment.GetEnvironmentVariable("PORT") ?? "8080";
+app.Urls.Add($"http://0.0.0.0:{port}");
+
+app.Logger.LogInformation("CrypterLicense API starting on port {Port}", port);
 
 app.Run();
