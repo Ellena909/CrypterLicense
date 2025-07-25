@@ -4,7 +4,10 @@ WORKDIR /source
 
 # Copy csproj and restore dependencies
 COPY CrypterLicense.csproj .
-RUN dotnet restore CrypterLicense.csproj
+
+# Configure NuGet sources and add retry logic for better reliability
+RUN dotnet nuget add source https://api.nuget.org/v3/index.json -n nuget.org --configfile /tmp/nuget.config || true
+RUN for i in 1 2 3; do dotnet restore CrypterLicense.csproj --disable-parallel --verbosity normal && break || sleep 10; done
 
 # Copy everything else and build
 COPY . .
